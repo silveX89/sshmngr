@@ -4,7 +4,7 @@ setup(
     name="sshmngr",
     version="1.0.0",
     description="SSH connection manager with interactive search and jumphost support",
-    author="Your Name",
+    author="silveX",
     packages=find_packages(),
     install_requires=[
         "paramiko",
