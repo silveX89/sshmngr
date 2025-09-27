@@ -5,7 +5,7 @@ jumphost support, and secure credential storage via the OS keyring.
 
 ## Quick start
 ```bash
-git clone https://github.com/YOURUSER/sshmngr.git
+git clone https://github.com/silveX89/sshmngr.git
 cd sshmngr
 pip install .
 ```
