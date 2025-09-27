@@ -1,0 +1,3 @@
+paramiko
+prompt_toolkit
+keyring
