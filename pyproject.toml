@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sshmngr"
+version = "0.4.0"
+description = "A tiny SSH connection manager with jumphost support"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "silveX" }]
+license = { text = "MIT" }
+dependencies = [
+    "paramiko>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/silveX89/sshmngr"
+
+[project.scripts]
+sshmngr = "sshmngr.sshmngr:main"
