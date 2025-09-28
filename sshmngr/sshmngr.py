@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 
 import paramiko
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import FuzzyWordCompleter
+from prompt_toolkit.completion import FuzzyCompleter, WordCompleter
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.shortcuts import print_formatted_text
 
@@ -172,7 +172,8 @@ def interactive_select(hosts: List[HostEntry]) -> HostEntry:
     print_formatted_text(HTML("<b>SSHMngr</b> – start typing a hostname, press <b>Enter</b> to connect."))
     print_formatted_text(HTML("Available hosts: " + ", ".join(names)))
 
-    completer = FuzzyWordCompleter(names, WORD=True, ignore_case=True)
+    base = WordCompleter(names, ignore_case=True)
+    completer = FuzzyCompleter(base)
     session = PromptSession()
     while True:
         try:
@@ -354,7 +355,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     p.add_argument("--version", action="version", version="sshmngr 1.0.0")
     return p.parse_args(argv)
 
-def main(argv: List[str]) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     ensure_config_files()
     args = parse_args(sys.argv[1:] if argv is None else argv)
 
