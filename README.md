@@ -19,8 +19,19 @@ python3 -m venv venv
 source venv/bin/activate
 pip install .           # or: pip install -e . for editable
 ```
-
 This exposes the `sshmngr` command on your PATH (within the venv).
+
+Enable Bash completion:
+User scope:
+```bash
+echo 'source /path/to/repo/completions/sshmngr.bash' >> ~/.bashrc
+source ~/.bashrc
+```
+System scope:
+```bash
+sudo cp completions/sshmngr.bash /etc/bash_completion.d/sshmngr
+source /etc/bash_completion.d/sshmngr
+```
 
 ## Files expected in your *current working directory*
 
