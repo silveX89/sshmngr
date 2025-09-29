@@ -1,0 +1,4 @@
+hostname,host,port,user,jumphost,jumpuser,notes
+server1,192.0.2.10,22,,,
+webserver,198.51.100.20,22,root,,
+firewall,fw.example.net,2222,admin,jump.company.net,jumper,"mgmt via non-std port"
