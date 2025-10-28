@@ -12,7 +12,14 @@ A tiny SSH connection helper with optional jump host support and simple CSV-driv
 
 ---
 
-## Install
+## Installing
+
+Clone the repository:
+
+```bash
+git clone https://github.com/silveX89/sshmngr.git
+cd sshmngr
+```
 
 ```bash
 python3 -m venv venv
