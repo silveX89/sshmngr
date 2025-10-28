@@ -70,8 +70,8 @@ ssh_user = ubuntu
 
 ```csv
 hostname,host,port,user,jumphost,jumpuser,notes
-coruscant,192.0.2.10,22,,,
-bespin,198.51.100.20,22,root,,
+server,192.0.2.10,22,,,
+router,198.51.100.20,22,root,,
 firewall,fw.example.net,2222,admin,jump.company.net,jumper,"mgmt via non-std port"
 ```
 
