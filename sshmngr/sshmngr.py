@@ -321,10 +321,25 @@ def _connect_jump(
             timeout=15,
         )
     except AuthenticationException:
+        try:
+            if channel is not None:
+                channel.close()
+        except Exception:
+            pass
+
         if jump_pw is None:
             pw = getpass.getpass(f"Password for {target_user}@{target_host}: ")
         else:
             pw = jump_pw
+
+        try:
+            channel = transport.open_channel("direct-tcpip", dest_addr, local_addr)
+        except Exception as exc:
+            print(f"Failed to open channel to {target_host}:{target_port}: {exc}")
+            tclient.close()
+            jclient.close()
+            sys.exit(1)
+
         try:
             tclient.connect(
                 hostname=target_host,
@@ -338,6 +353,10 @@ def _connect_jump(
             )
         except Exception as exc:
             print(f"Failed to authenticate with target {target_user}@{target_host}: {exc}")
+            try:
+                channel.close()
+            except Exception:
+                pass
             tclient.close()
             jclient.close()
             sys.exit(1)
@@ -363,91 +382,3 @@ def connect_via_jump(
     try:
         _connect_jump(jumphost, jumpuser, target_host, target_port, target_user)
     except SSHException as exc:
-        print(f"SSH error: {exc}")
-        sys.exit(1)
-
-
-def _interactive_shell(client: paramiko.SSHClient) -> None:
-    try:
-        channel = client.invoke_shell()
-        import select
-        import termios
-        import tty
-
-        oldtty = termios.tcgetattr(sys.stdin)
-        try:
-            tty.setraw(sys.stdin.fileno())
-            tty.setcbreak(sys.stdin.fileno())
-            channel.settimeout(0.0)
-
-            while True:
-                readable, _, _ = select.select([channel, sys.stdin], [], [])
-                if channel in readable:
-                    try:
-                        data = channel.recv(1024)
-                        if not data:
-                            break
-                        sys.stdout.write(data.decode(errors="ignore"))
-                        sys.stdout.flush()
-                    except Exception:
-                        pass
-                if sys.stdin in readable:
-                    data = os.read(sys.stdin.fileno(), 1024)
-                    if not data:
-                        break
-                    channel.send(data)
-        finally:
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, oldtty)
-    except Exception as exc:
-        print(f"Interactive shell error: {exc}")
-    finally:
-        client.close()
-
-
-def main() -> None:
-    cfg = read_config(_config_path())
-    hosts = load_hosts(_hosts_path())
-    if not hosts:
-        sys.exit(1)
-
-    if len(sys.argv) >= 2:
-        name = sys.argv[1]
-        if name not in hosts:
-            print(f"Host '{name}' not found in hosts.csv")
-            print("Available:", ", ".join(sorted(hosts)))
-            sys.exit(1)
-        target_name = name
-    else:
-        target_name = choose_target(hosts)
-        if not target_name:
-            sys.exit(1)
-
-    plan = build_connection_plan(cfg, hosts[target_name])
-    target_host = plan["target_host"]
-    target_port = int(plan["target_port"] or "22")
-    target_user = plan["target_user"]
-    jumphost = plan["jumphost"]
-    jumpuser = plan["jumpuser"]
-
-    if not target_host:
-        print("No target host/IP specified for the selected entry.")
-        sys.exit(1)
-
-    if not target_user:
-        target_user = input("No user found. Please enter SSH username for target: ").strip()
-
-    if jumphost:
-        connect_via_jump(jumphost, jumpuser or target_user, target_host, target_port, target_user)
-    else:
-        print(f"Connecting directly to {target_user}@{target_host}:{target_port}")
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ok, _ = _try_auth_connect(client, target_host, target_port, target_user)
-        if not ok:
-            sys.exit(1)
-        print(f"Connected to {target_user}@{target_host}. Starting interactive shell...")
-        _interactive_shell(client)
-
-
-if __name__ == "__main__":
-    main()
