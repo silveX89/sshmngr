@@ -382,3 +382,5 @@ def connect_via_jump(
     try:
         _connect_jump(jumphost, jumpuser, target_host, target_port, target_user)
     except SSHException as exc:
+        print(f"SSH error: {exc}")
+        sys.exit(1)
