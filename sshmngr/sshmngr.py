@@ -1,386 +1,408 @@
 #!/usr/bin/env python3
-"""Simple SSH connection helper with optional jumphost support."""
-
+"""sshmngr - SSH connection helper with Claude Code-inspired terminal UI."""
 from __future__ import annotations
 
+import configparser
 import csv
-import getpass
 import os
+import subprocess
 import sys
-from typing import Dict, Iterable, List, Optional, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
 
-import paramiko
-from paramiko.ssh_exception import AuthenticationException, SSHException
+# ── optional deps ──────────────────────────────────────────────────────────────
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+    from rich.rule import Rule
+    from rich import box as rich_box
+    RICH_OK = True
+except ImportError:
+    RICH_OK = False
 
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import FuzzyWordCompleter
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.styles import Style
+    PROMPT_OK = True
+except ImportError:
+    PROMPT_OK = False
 
-###############################################################################
-# Configuration helpers
-###############################################################################
+# ── constants ──────────────────────────────────────────────────────────────────
+VERSION = "0.7.0"
 
-def _project_root() -> str:
-    return os.getcwd()
-
-
-def _config_path() -> str:
-    return os.path.join(_project_root(), "config.ini")
-
-
-def _hosts_path() -> str:
-    return os.path.join(_project_root(), "hosts.csv")
-
-
-def read_config(path: str) -> Dict[str, str]:
-    cfg: Dict[str, str] = {}
-    if not os.path.exists(path):
-        print(f"WARNING: config.ini not found at {path}. Using built-in defaults.")
-        return cfg
-
-    with open(path, "r", encoding="utf-8") as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            cfg[key.strip()] = value.strip()
-    return cfg
+_XDG        = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+CONFIG_DIR  = _XDG / "sshmngr"
+HOSTS_CSV   = CONFIG_DIR / "hosts.csv"
+CONFIG_INI  = CONFIG_DIR / "config.ini"
+HISTORY_FILE = CONFIG_DIR / ".history"
 
 
-def load_hosts(path: str) -> Dict[str, Dict[str, str]]:
-    hosts: Dict[str, Dict[str, str]] = {}
-    if not os.path.exists(path):
-        print(f"ERROR: hosts.csv not found at {path}")
-        return hosts
-
-    with open(path, "r", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            name = (row.get("hostname") or "").strip()
-            if not name:
-                continue
-            hosts[name] = {
-                "hostname": name,
-                "host": (row.get("host") or "").strip(),
-                "port": (row.get("port") or "").strip(),
-                "user": (row.get("user") or "").strip(),
-                "jumphost": (row.get("jumphost") or "").strip(),
-                "jumpuser": (row.get("jumpuser") or "").strip(),
-                "notes": (row.get("notes") or "").strip(),
-            }
-    return hosts
+# ── data structures ────────────────────────────────────────────────────────────
+@dataclass
+class HostEntry:
+    hostname: str
+    host:     str = ""   # IP or FQDN to connect to
+    port:     int = 22
+    user:     str = ""   # per-host user override
+    jumphost: str = ""   # per-host jump server override
+    jumpuser: str = ""   # per-host jump user override
+    notes:    str = ""
 
 
-###############################################################################
-# Host selection helpers
-###############################################################################
+@dataclass
+class Config:
+    global_jumphost: bool = False
+    jumpserver:      str  = ""
+    jumpuser:        str  = ""
+    ssh_user:        str  = ""
 
-def _prompt_choose_target(names: Iterable[str]) -> Optional[str]:
-    names = list(names)
-    print("Available hosts:")
-    for idx, name in enumerate(names, 1):
-        print(f"  {idx:2d}) {name}")
 
-    try:
-        selection = int(input("Select number: ").strip())
-    except Exception:
-        selection = 0
-
-    if 1 <= selection <= len(names):
-        return names[selection - 1]
-
-    print("Invalid selection.")
+# ── config / hosts loaders ─────────────────────────────────────────────────────
+def _find_file(name: str) -> Optional[Path]:
+    """Search CWD first, then ~/.config/sshmngr/."""
+    cwd = Path(name)
+    if cwd.exists():
+        return cwd
+    xdg = CONFIG_DIR / name
+    if xdg.exists():
+        return xdg
     return None
 
 
-def _supports_fullscreen() -> bool:
-    return sys.stdin.isatty() and sys.stdout.isatty()
+def _preprocess_ini(raw: str) -> str:
+    """Make config.ini safe for configparser (add section header, drop bare words)."""
+    lines: List[str] = []
+    has_section = any(ln.strip().startswith("[") for ln in raw.splitlines())
+    if not has_section:
+        lines.append("[main]")
+    for ln in raw.splitlines():
+        stripped = ln.strip()
+        # Keep comments, section headers, and key=value lines; drop everything else
+        if stripped.startswith(("#", ";")) or stripped.startswith("[") or "=" in stripped:
+            lines.append(ln)
+    return "\n".join(lines)
 
 
-def _tui_select_host(stdscr, names: List[str]) -> Optional[str]:
-    import curses
+def load_config() -> Config:
+    cfg = Config()
+    path = _find_file("config.ini")
+    if path is None:
+        return cfg
 
-    try:
-        curses.curs_set(1)
-    except curses.error:
-        pass
+    raw = path.read_text(encoding="utf-8")
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), strict=False)
+    parser.read_string(_preprocess_ini(raw))
 
-    curses.noecho()
-    stdscr.keypad(True)
+    section = parser.sections()[0] if parser.sections() else "main"
 
-    query = ""
-    selected_idx = 0
-    scroll_offset = 0
+    def get(key: str, fallback: str = "") -> str:
+        return parser.get(section, key, fallback=fallback).strip()
 
-    def _filtered(text: str) -> List[str]:
-        lower = text.lower()
-        return [name for name in names if lower in name.lower()]
+    cfg.global_jumphost = get("global_jumphost", "no").lower() in ("yes", "true", "1")
+    cfg.jumpserver = get("jumpserver")
+    cfg.jumpuser   = get("jumpuser")
+    cfg.ssh_user   = get("ssh_user")
+    return cfg
+
+
+def load_hosts() -> List[HostEntry]:
+    path = _find_file("hosts.csv")
+    if path is None:
+        return []
+
+    entries: List[HostEntry] = []
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = [h.strip().lower() for h in (reader.fieldnames or [])]
+
+        if "hostname" in fieldnames:
+            # Full format: hostname,host,port,user,jumphost,jumpuser,notes
+            for raw_row in reader:
+                row = {k.strip().lower(): (v or "").strip() for k, v in raw_row.items() if k}
+                hostname = row.get("hostname", "")
+                if not hostname or hostname.startswith("#"):
+                    continue
+                try:
+                    port = int(row.get("port") or "22")
+                except ValueError:
+                    port = 22
+                entries.append(HostEntry(
+                    hostname=hostname,
+                    host=row.get("host", ""),
+                    port=port,
+                    user=row.get("user", ""),
+                    jumphost=row.get("jumphost", ""),
+                    jumpuser=row.get("jumpuser", ""),
+                    notes=row.get("notes", ""),
+                ))
+        elif "host" in fieldnames and "addr" in fieldnames:
+            # Two-column shorthand: host (alias/name), addr (IP)
+            for raw_row in reader:
+                row = {k.strip().lower(): (v or "").strip() for k, v in raw_row.items() if k}
+                hostname = row.get("host", "")
+                if not hostname or hostname.startswith("#"):
+                    continue
+                entries.append(HostEntry(
+                    hostname=hostname,
+                    host=row.get("addr", ""),
+                ))
+        elif fieldnames:
+            # Any other CSV with a header: treat first column as hostname, second as host/IP
+            first_col  = fieldnames[0]
+            second_col = fieldnames[1] if len(fieldnames) > 1 else None
+            for raw_row in reader:
+                row = {k.strip().lower(): (v or "").strip() for k, v in raw_row.items() if k}
+                hostname = row.get(first_col, "")
+                if not hostname or hostname.startswith("#"):
+                    continue
+                host_ip = row.get(second_col, "") if second_col else ""
+                entries.append(HostEntry(hostname=hostname, host=host_ip))
+        else:
+            # No header — raw lines, first column is hostname
+            f.seek(0)
+            for row in csv.reader(f):
+                if not row:
+                    continue
+                name = row[0].strip()
+                if not name or name.startswith("#"):
+                    continue
+                entries.append(HostEntry(hostname=name))
+
+    entries.sort(key=lambda e: e.hostname.lower())
+    return entries
+
+
+# ── SSH command builder ────────────────────────────────────────────────────────
+def build_ssh_command(entry: HostEntry, config: Config) -> List[str]:
+    """Build SSH command using ProxyJump (-J) for jump hosts.
+
+    System SSH with -J handles SSH banners from the target host natively,
+    avoiding the 'Error reading SSH protocol banner' that occurs with paramiko.
+    """
+    cmd = ["ssh"]
+
+    # Resolve effective values (per-host overrides global config)
+    user     = entry.user     or config.ssh_user
+    jumphost = entry.jumphost or (config.jumpserver if config.global_jumphost else "")
+    jumpuser = entry.jumpuser or config.jumpuser
+
+    # ProxyJump: handles banner + forwarding transparently
+    if jumphost:
+        jump_spec = f"{jumpuser}@{jumphost}" if jumpuser else jumphost
+        cmd += ["-J", jump_spec]
+
+    # Non-standard port
+    if entry.port and entry.port != 22:
+        cmd += ["-p", str(entry.port)]
+
+    # Target: prefer explicit host/IP, fall back to hostname
+    target_host = entry.host or entry.hostname
+    target = f"{user}@{target_host}" if user else target_host
+    cmd.append(target)
+
+    return cmd
+
+
+# ── UI rendering ───────────────────────────────────────────────────────────────
+def _plain_display(entries: List[HostEntry], config: Config) -> None:
+    """Fallback display without rich."""
+    print(f"\n  sshmngr v{VERSION}")
+    if config.jumpserver and config.global_jumphost:
+        j = f"{config.jumpuser}@{config.jumpserver}" if config.jumpuser else config.jumpserver
+        print(f"  Jump: {j}")
+    if config.ssh_user:
+        print(f"  User: {config.ssh_user}")
+    print()
+    for e in entries:
+        line = f"  {e.hostname}"
+        if e.host:
+            line += f"  {e.host}"
+        eff_user = e.user or config.ssh_user
+        if eff_user:
+            line += f"  ({eff_user})"
+        if e.notes:
+            line += f"  # {e.notes}"
+        print(line)
+    print()
+
+
+def display_ui(entries: List[HostEntry], config: Config) -> None:
+    """Render the Claude Code-inspired header and host table."""
+    if not RICH_OK:
+        _plain_display(entries, config)
+        return
+
+    console = Console()
+    console.print()
+
+    # ── header ─────────────────────────────────────────────────────────────────
+    header = Text()
+    header.append("sshmngr", style="bold cyan")
+    header.append(f"  v{VERSION}", style="dim")
+
+    if config.jumpserver and config.global_jumphost:
+        jump_str = (
+            f"{config.jumpuser}@{config.jumpserver}"
+            if config.jumpuser else config.jumpserver
+        )
+        header.append("  ·  Jump: ", style="dim")
+        header.append(jump_str, style="yellow")
+
+    if config.ssh_user:
+        header.append("  ·  User: ", style="dim")
+        header.append(config.ssh_user, style="green")
+
+    console.print(header)
+    console.print(Rule(style="dim"))
+    console.print()
+
+    # ── host table ─────────────────────────────────────────────────────────────
+    if not entries:
+        console.print(
+            "  [dim]No hosts found. Add entries to "
+            "~/.config/sshmngr/hosts.csv (or ./hosts.csv)[/dim]"
+        )
+    else:
+        table = Table(
+            box=rich_box.SIMPLE,
+            show_header=True,
+            header_style="bold dim",
+            padding=(0, 2),
+            show_edge=False,
+        )
+        table.add_column("Hostname",  style="cyan",          no_wrap=True)
+        table.add_column("IP / Host", style="white")
+        table.add_column("Port",      style="dim",            justify="right")
+        table.add_column("User",      style="green")
+        table.add_column("Via Jump",  style="yellow")
+        table.add_column("Notes",     style="italic dim")
+
+        for e in entries:
+            eff_user = e.user or config.ssh_user or ""
+            eff_jump = e.jumphost or (config.jumpserver if config.global_jumphost else "")
+            port_str = str(e.port) if e.port != 22 else ""
+            table.add_row(e.hostname, e.host, port_str, eff_user, eff_jump, e.notes)
+
+        console.print(table)
+
+    console.print()
+    console.print(
+        "  [dim]Tab / type to autocomplete  ·  Enter to connect  ·  Ctrl+C to quit[/dim]"
+    )
+    console.print()
+
+
+def show_connect(cmd: List[str]) -> None:
+    if not RICH_OK:
+        print(f"  Connecting: {' '.join(cmd)}\n")
+        return
+    console = Console()
+    console.print()
+    label = Text("  Connecting: ", style="dim")
+    label.append(" ".join(cmd), style="cyan")
+    console.print(label)
+    console.print()
+
+
+# ── interactive prompt ─────────────────────────────────────────────────────────
+def run_prompt(entries: List[HostEntry]) -> str:
+    host_names = [e.hostname for e in entries]
+
+    if not PROMPT_OK:
+        try:
+            return input(" > ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            raise SystemExit(130)
+
+    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HISTORY_FILE.touch(exist_ok=True)
+
+    session: PromptSession = PromptSession(
+        history=FileHistory(str(HISTORY_FILE)),
+        auto_suggest=AutoSuggestFromHistory(),
+        style=Style.from_dict({"prompt": "cyan bold"}),
+    )
+    completer = FuzzyWordCompleter(words=host_names, WORD=True, sentence=True)
 
     while True:
-        filtered = _filtered(query)
-        if not filtered:
-            selected_idx = 0
-            scroll_offset = 0
-        elif selected_idx >= len(filtered):
-            selected_idx = len(filtered) - 1
-
-        height, width = stdscr.getmaxyx()
-        stdscr.erase()
-
-        prompt = f"Search: {query}"
-        prompt_x = max((width - len(prompt)) // 2, 0)
-        stdscr.addnstr(0, max(prompt_x, 0), prompt, max(width, 0))
-        cursor_x = min(prompt_x + len("Search: ") + len(query), max(width - 1, 0))
-        stdscr.move(0, cursor_x)
-
-        list_start_row = 2
-        visible_rows = max(0, height - list_start_row)
-
-        if filtered and visible_rows > 0:
-            if selected_idx < scroll_offset:
-                scroll_offset = selected_idx
-            if selected_idx >= scroll_offset + visible_rows:
-                scroll_offset = selected_idx - visible_rows + 1
-
-            for row in range(visible_rows):
-                idx = scroll_offset + row
-                if idx >= len(filtered):
-                    break
-                name = filtered[idx]
-                attr = curses.A_REVERSE if idx == selected_idx else curses.A_NORMAL
-                stdscr.addnstr(list_start_row + row, 2, name, max(width - 4, 0), attr)
-        elif visible_rows > 0:
-            message = "No matching hosts"
-            msg_x = max((width - len(message)) // 2, 0)
-            stdscr.addnstr(list_start_row, msg_x, message, max(width - msg_x, 0), curses.A_DIM)
-
-        stdscr.refresh()
-        key = stdscr.getch()
-
-        if key in (curses.KEY_ENTER, 10, 13):
-            if filtered:
-                return filtered[selected_idx]
-        elif key == 27:  # ESC
-            return None
-        elif key == curses.KEY_UP:
-            if filtered:
-                selected_idx = max(0, selected_idx - 1)
-        elif key == curses.KEY_DOWN:
-            if filtered:
-                selected_idx = min(len(filtered) - 1, selected_idx + 1)
-        elif key in (curses.KEY_BACKSPACE, 127, 8):
-            if query:
-                query = query[:-1]
-                selected_idx = 0
-                scroll_offset = 0
-        elif key == curses.KEY_RESIZE:
-            continue
-        elif 32 <= key <= 126:
-            query += chr(key)
-            selected_idx = 0
-            scroll_offset = 0
-
-
-def choose_target(hosts: Dict[str, Dict[str, str]]) -> Optional[str]:
-    names = sorted(hosts)
-    if not names:
-        print("No hosts found in hosts.csv")
-        return None
-
-    if _supports_fullscreen():
         try:
-            import curses
-        except ImportError:
-            curses = None
-        if curses is not None:
-            try:
-                return curses.wrapper(lambda stdscr: _tui_select_host(stdscr, names))
-            except curses.error:
-                pass
-            except KeyboardInterrupt:
-                return None
-    return _prompt_choose_target(names)
+            text = session.prompt(
+                [("class:prompt", " > ")],
+                completer=completer,
+                complete_while_typing=True,
+            ).strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            raise SystemExit(130)
+        if text:
+            return text
 
 
-###############################################################################
-# Connection logic
-###############################################################################
-
-def build_connection_plan(cfg: Dict[str, str], host_row: Dict[str, str]) -> Dict[str, Optional[str]]:
-    global_jump = cfg.get("global_jumphost", "no").lower() in {"yes", "true", "1"}
-    default_jump_host = (cfg.get("jumpserver") or "").strip() or None
-    default_jump_user = (cfg.get("jumpuser") or "").strip() or None
-    default_user = (cfg.get("ssh_user") or "").strip() or None
-
-    target_host = host_row.get("host") or host_row.get("hostname")
-    target_port = host_row.get("port") or "22"
-    target_user = host_row.get("user") or default_user
-
-    perhost_jump_host = host_row.get("jumphost") or None
-    perhost_jump_user = host_row.get("jumpuser") or None
-
-    jumphost: Optional[str] = None
-    jumpuser: Optional[str] = None
-
-    if perhost_jump_host:
-        jumphost = perhost_jump_host
-        jumpuser = perhost_jump_user or default_jump_user or target_user
-    elif global_jump and default_jump_host:
-        jumphost = default_jump_host
-        jumpuser = default_jump_user or target_user
-
-    return {
-        "target_host": target_host,
-        "target_port": target_port,
-        "target_user": target_user,
-        "jumphost": jumphost,
-        "jumpuser": jumpuser,
-    }
+# ── host resolution ────────────────────────────────────────────────────────────
+def find_entry(text: str, entries: List[HostEntry]) -> HostEntry:
+    """Resolve typed text to the best matching HostEntry."""
+    lc = text.lower()
+    # Exact hostname match
+    for e in entries:
+        if e.hostname.lower() == lc:
+            return e
+    # Unique prefix match
+    matches = [e for e in entries if e.hostname.lower().startswith(lc)]
+    if len(matches) == 1:
+        return matches[0]
+    # Exact IP/host match
+    for e in entries:
+        if e.host.lower() == lc:
+            return e
+    # Literal fallback (ssh handles unknown hosts natively)
+    return HostEntry(hostname=text, host=text)
 
 
-def _try_auth_connect(
-    client: paramiko.SSHClient,
-    hostname: str,
-    port: int,
-    username: str,
-) -> Tuple[bool, Optional[str]]:
-    password_used: Optional[str] = None
+# ── entry point ────────────────────────────────────────────────────────────────
+def main(argv: Optional[List[str]] = None) -> int:
+    import argparse
+
+    argv = argv if argv is not None else sys.argv[1:]
+    ap = argparse.ArgumentParser(prog="sshmngr", description="SSH connection helper.")
+    ap.add_argument("host",         nargs="?",          help="Connect directly to this host.")
+    ap.add_argument("--list-hosts", action="store_true", help="Print known hosts (for shell completion).")
+    args = ap.parse_args(argv)
+
+    config  = load_config()
+    entries = load_hosts()
+
+    if args.list_hosts:
+        for e in entries:
+            print(e.hostname)
+        return 0
+
+    # Render TUI
+    display_ui(entries, config)
+
+    # Get target (from CLI arg or interactive prompt)
+    target_text = args.host if args.host else run_prompt(entries)
+    if not target_text:
+        return 1
+
+    entry = find_entry(target_text, entries)
+    cmd   = build_ssh_command(entry, config)
+
+    show_connect(cmd)
+
     try:
-        client.connect(
-            hostname=hostname,
-            port=port,
-            username=username,
-            allow_agent=True,
-            look_for_keys=True,
-            timeout=15,
-        )
-        return True, None
-    except AuthenticationException:
-        pw = getpass.getpass(f"Password for {username}@{hostname}: ")
-        try:
-            client.connect(
-                hostname=hostname,
-                port=port,
-                username=username,
-                password=pw,
-                allow_agent=False,
-                look_for_keys=False,
-                timeout=15,
-            )
-            password_used = pw
-            return True, password_used
-        except Exception as exc:
-            print(f"Authentication failed for {username}@{hostname}: {exc}")
-            return False, None
-    except Exception as exc:
-        print(f"Failed to connect to {username}@{hostname}:{port} - {exc}")
-        return False, None
+        return subprocess.call(cmd)
+    except FileNotFoundError:
+        print("Error: 'ssh' not found in PATH.", file=sys.stderr)
+        return 127
+    except KeyboardInterrupt:
+        return 130
 
 
-def _connect_jump(
-    jumphost: str,
-    jumpuser: str,
-    target_host: str,
-    target_port: int,
-    target_user: str,
-):
-    print(f"Connecting to jumphost {jumpuser}@{jumphost}...")
-    jclient = paramiko.SSHClient()
-    jclient.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ok, jump_pw = _try_auth_connect(jclient, jumphost, 22, jumpuser)
-    if not ok:
-        sys.exit(1)
-
-    transport = jclient.get_transport()
-    if not transport:
-        print("Failed to obtain transport from jumphost connection")
-        jclient.close()
-        sys.exit(1)
-
-    dest_addr = (target_host, target_port)
-    local_addr = ("", 0)
-    try:
-        channel = transport.open_channel("direct-tcpip", dest_addr, local_addr)
-    except Exception as exc:
-        print(f"Failed to open channel to {target_host}:{target_port}: {exc}")
-        jclient.close()
-        sys.exit(1)
-
-    tclient = paramiko.SSHClient()
-    tclient.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    print(f"Connecting to target {target_user}@{target_host}:{target_port} via jumphost...")
-    try:
-        tclient.connect(
-            hostname=target_host,
-            port=target_port,
-            username=target_user,
-            sock=channel,
-            allow_agent=True,
-            look_for_keys=True,
-            timeout=15,
-        )
-    except AuthenticationException:
-        try:
-            if channel is not None:
-                channel.close()
-        except Exception:
-            pass
-
-        if jump_pw is None:
-            pw = getpass.getpass(f"Password for {target_user}@{target_host}: ")
-        else:
-            pw = jump_pw
-
-        try:
-            channel = transport.open_channel("direct-tcpip", dest_addr, local_addr)
-        except Exception as exc:
-            print(f"Failed to open channel to {target_host}:{target_port}: {exc}")
-            tclient.close()
-            jclient.close()
-            sys.exit(1)
-
-        try:
-            tclient.connect(
-                hostname=target_host,
-                port=target_port,
-                username=target_user,
-                password=pw,
-                sock=channel,
-                allow_agent=False,
-                look_for_keys=False,
-                timeout=15,
-            )
-        except Exception as exc:
-            print(f"Failed to authenticate with target {target_user}@{target_host}: {exc}")
-            try:
-                channel.close()
-            except Exception:
-                pass
-            tclient.close()
-            jclient.close()
-            sys.exit(1)
-    except Exception as exc:
-        print(f"Failed to connect to target via jumphost: {exc}")
-        tclient.close()
-        jclient.close()
-        sys.exit(1)
-
-    print("Connected. Starting interactive shell...")
-    _interactive_shell(tclient)
-    tclient.close()
-    jclient.close()
-
-
-def connect_via_jump(
-    jumphost: str,
-    jumpuser: str,
-    target_host: str,
-    target_port: int,
-    target_user: str,
-):
-    try:
-        _connect_jump(jumphost, jumpuser, target_host, target_port, target_user)
-    except SSHException as exc:
-        print(f"SSH error: {exc}")
-        sys.exit(1)
+if __name__ == "__main__":
+    raise SystemExit(main())
