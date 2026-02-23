@@ -28,13 +28,13 @@ try:
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
     from prompt_toolkit.styles import Style
-    from prompt_toolkit.application.current import get_app
+    from prompt_toolkit.key_binding import KeyBindings
     PROMPT_OK = True
 except ImportError:
     PROMPT_OK = False
 
 # ── constants ──────────────────────────────────────────────────────────────────
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 
 _XDG        = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 CONFIG_DIR  = _XDG / "sshmngr"
@@ -384,7 +384,13 @@ def show_connect(cmd: List[str], dry_run: bool = False) -> None:
 
 # ── interactive prompt ─────────────────────────────────────────────────────────
 def run_prompt(entries: List[HostEntry]) -> tuple:
-    """Show interactive prompt; returns (host_text, CmdFlags)."""
+    """Show interactive prompt; returns (host_text, CmdFlags).
+
+    WoW-chat-inspired slash commands: type /o (or /v, /d) then press Space.
+    The prefix vanishes from the buffer, the prompt turns orange, and you type
+    the hostname normally with full fuzzy autocomplete still active.
+    Commands accumulate — e.g. /o<space>/v<space> activates both.
+    """
     host_names = [e.hostname for e in entries]
 
     if not PROMPT_OK:
@@ -398,6 +404,37 @@ def run_prompt(entries: List[HostEntry]) -> tuple:
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     HISTORY_FILE.touch(exist_ok=True)
 
+    # Mutable mode state shared between key binding and prompt callable
+    _mode: Dict[str, bool] = {
+        "bypass_jumphost": False,
+        "verbose":         False,
+        "dry_run":         False,
+    }
+
+    _CMD_MAP = {"/o": "bypass_jumphost", "/v": "verbose", "/d": "dry_run"}
+
+    kb = KeyBindings()
+
+    @kb.add(" ")
+    def _on_space(event):
+        """Activate a slash command on Space, WoW-style; otherwise insert space."""
+        buf  = event.app.current_buffer
+        text = buf.text  # what the user has typed so far
+
+        if text in _CMD_MAP:
+            _mode[_CMD_MAP[text]] = True
+            buf.reset()               # wipe the /o (or /v, /d) from the buffer
+            event.app.invalidate()    # redraw prompt immediately
+        else:
+            buf.insert_text(" ")
+
+    def _dynamic_prompt():
+        """Prompt label; turns orange with a mode tag when any command is active."""
+        if any(_mode.values()):
+            tag = "/".join(k for k, v in zip(("o", "v", "d"), _mode.values()) if v)
+            return [("class:prompt.override", f" /{tag} > ")]
+        return [("class:prompt", " > ")]
+
     session: PromptSession = PromptSession(
         history=FileHistory(str(HISTORY_FILE)),
         auto_suggest=AutoSuggestFromHistory(),
@@ -405,20 +442,15 @@ def run_prompt(entries: List[HostEntry]) -> tuple:
             "prompt":          "bold cyan",
             "prompt.override": "bold fg:darkorange",
         }),
+        key_bindings=kb,
     )
     completer = FuzzyWordCompleter(words=host_names, WORD=True)
 
-    def _dynamic_prompt():
-        """Return prompt tokens; turns orange when a slash command is active."""
-        try:
-            buf_text = get_app().current_buffer.text
-            if buf_text.startswith("/"):
-                return [("class:prompt.override", " ⚡ > ")]
-        except Exception:
-            pass
-        return [("class:prompt", " > ")]
-
     while True:
+        # Reset mode at the start of each prompt so each connection starts clean
+        for k in _mode:
+            _mode[k] = False
+
         try:
             text = session.prompt(
                 _dynamic_prompt,
@@ -428,8 +460,16 @@ def run_prompt(entries: List[HostEntry]) -> tuple:
         except (KeyboardInterrupt, EOFError):
             print()
             raise SystemExit(130)
+
         if text:
-            return parse_command(text)
+            # Also support typed slash prefixes (e.g. from CLI args or old habit)
+            host_text, typed_flags = parse_command(text)
+            flags = CmdFlags(
+                bypass_jumphost=_mode["bypass_jumphost"] or typed_flags.bypass_jumphost,
+                verbose        =_mode["verbose"]         or typed_flags.verbose,
+                dry_run        =_mode["dry_run"]         or typed_flags.dry_run,
+            )
+            return host_text or text, flags
 
 
 # ── host resolution ────────────────────────────────────────────────────────────
