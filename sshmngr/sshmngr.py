@@ -328,7 +328,7 @@ def run_prompt(entries: List[HostEntry]) -> str:
         auto_suggest=AutoSuggestFromHistory(),
         style=Style.from_dict({"prompt": "cyan bold"}),
     )
-    completer = FuzzyWordCompleter(words=host_names, WORD=True, sentence=True)
+    completer = FuzzyWordCompleter(words=host_names, WORD=True)
 
     while True:
         try:

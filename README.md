@@ -12,33 +12,15 @@ A tiny SSH connection helper with optional jump host support and simple CSV-driv
 
 ---
 
-## Installing
-
-Clone the repository:
-
-```bash
-git clone https://github.com/silveX89/sshmngr.git
-cd sshmngr
-```
+## Install
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install .           # or: pip install -e . for editable
 ```
-This exposes the `sshmngr` command on your PATH (within the venv).
 
-Enable Bash completion:
-User scope:
-```bash
-echo 'source /path/to/repo/completions/sshmngr.bash' >> ~/.bashrc
-source ~/.bashrc
-```
-System scope:
-```bash
-sudo cp completions/sshmngr.bash /etc/bash_completion.d/sshmngr
-source /etc/bash_completion.d/sshmngr
-```
+This exposes the `sshmngr` command on your PATH (within the venv).
 
 ## Files expected in your *current working directory*
 
@@ -70,8 +52,8 @@ ssh_user = ubuntu
 
 ```csv
 hostname,host,port,user,jumphost,jumpuser,notes
-server,192.0.2.10,22,,,
-router,198.51.100.20,22,root,,
+coruscant,192.0.2.10,22,,,
+bespin,198.51.100.20,22,root,,
 firewall,fw.example.net,2222,admin,jump.company.net,jumper,"mgmt via non-std port"
 ```
 
@@ -79,3 +61,11 @@ firewall,fw.example.net,2222,admin,jump.company.net,jumper,"mgmt via non-std por
 - `jumphost`/`jumpuser` override `jumpserver`/`jumpuser` from `config.ini`.
 - If `global_jumphost = yes`, the default `jumpserver` is used unless a row sets its own `jumphost`.
 - If `global_jumphost = no`, a jumphost is used only when set per-host.
+
+## Repository hygiene
+
+A preconfigured `.gitignore` keeps build artifacts, virtual environments, caches, and OS/editor files out of your repo. By default it **does not** ignore `config.ini` and `hosts.csv` so you can version example files; uncomment those lines in `.gitignore` if you prefer to keep operational configs out of Git.
+
+## License
+MIT
+

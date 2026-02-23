@@ -6,8 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 # Setup
-python3 -m venv venv
-source venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .          # editable install (picks up changes without reinstall)
 
 # Run
@@ -47,10 +47,12 @@ ssh -J jumpuser@jumpserver user@target-ip
 - Any other header → first col = hostname, second col = IP
 - No header → raw hostnames, one per line
 
-**`config.ini`** has no `[section]` header — `_preprocess_ini()` injects `[main]` before passing to `configparser`.
+**`config.ini`** has no `[section]` header — `_preprocess_ini()` injects `[main]` before passing to `configparser`. Keys: `global_jumphost` (yes/no), `jumpserver`, `jumpuser`, `ssh_user`.
 
-**Dependencies:** `rich` (display), `prompt_toolkit` (interactive prompt). Both are optional — the code degrades gracefully if either is missing.
+**`find_entry()` resolution order:** exact hostname → unique prefix → exact IP/host → literal fallback (passed raw to `ssh`).
 
-**Entry point:** `sshmngr.sshmngr:main` as defined in `pyproject.toml`.
+**Dependencies:** `rich` (display), `prompt_toolkit` (interactive prompt). Both are optional — the code degrades gracefully if either is missing (`RICH_OK` / `PROMPT_OK` flags). Without `prompt_toolkit`, falls back to plain `input()`.
+
+**Entry point:** `sshmngr.sshmngr:main` as defined in `pyproject.toml`. Version string is `VERSION` at the top of `sshmngr.py`; update both it and `pyproject.toml` when bumping.
 
 **History file:** `~/.config/sshmngr/.history` (prompt_toolkit FileHistory).
