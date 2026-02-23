@@ -7,9 +7,9 @@ import csv
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # ── optional deps ──────────────────────────────────────────────────────────────
 try:
@@ -28,18 +28,34 @@ try:
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
     from prompt_toolkit.styles import Style
+    from prompt_toolkit.application.current import get_app
     PROMPT_OK = True
 except ImportError:
     PROMPT_OK = False
 
 # ── constants ──────────────────────────────────────────────────────────────────
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 _XDG        = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 CONFIG_DIR  = _XDG / "sshmngr"
 HOSTS_CSV   = CONFIG_DIR / "hosts.csv"
 CONFIG_INI  = CONFIG_DIR / "config.ini"
 HISTORY_FILE = CONFIG_DIR / ".history"
+
+# ASCII wizard shown above the header
+_WIZARD_LINES = [
+    ("  *    ˙    *    ˙    *    ˙    *  ", "bold yellow"),
+    ("  ˙    *    ˙    *    ˙    *    ˙  ", "yellow"),
+    ("         /\\     /\\               ", "cyan"),
+    ("        /  \\___/  \\              ", "cyan"),
+    ("       / .-. . .-. \\             ", "cyan"),
+    ("      | ( o ) ( o ) |            ", "bold cyan"),
+    ("      |   \\ ~~~ /   |            ", "cyan"),
+    ("       \\   ~~~~~   /             ", "cyan"),
+    ("        \\_________/              ", "cyan"),
+    ("            |||||                ", "bold cyan"),
+    ("          __||_||__              ", "cyan"),
+]
 
 
 # ── data structures ────────────────────────────────────────────────────────────
@@ -60,6 +76,14 @@ class Config:
     jumpserver:      str  = ""
     jumpuser:        str  = ""
     ssh_user:        str  = ""
+
+
+@dataclass
+class CmdFlags:
+    """Runtime flags set via slash commands at the prompt."""
+    bypass_jumphost: bool = False   # /o  — connect direct, skip all jump logic
+    verbose:         bool = False   # /v  — pass -v to ssh
+    dry_run:         bool = False   # /d  — print ssh command, do not connect
 
 
 # ── config / hosts loaders ─────────────────────────────────────────────────────
@@ -178,13 +202,20 @@ def load_hosts() -> List[HostEntry]:
 
 
 # ── SSH command builder ────────────────────────────────────────────────────────
-def build_ssh_command(entry: HostEntry, config: Config) -> List[str]:
+def build_ssh_command(entry: HostEntry, config: Config, flags: Optional[CmdFlags] = None) -> List[str]:
     """Build SSH command using ProxyJump (-J) for jump hosts.
 
     System SSH with -J handles SSH banners from the target host natively,
     avoiding the 'Error reading SSH protocol banner' that occurs with paramiko.
     """
+    if flags is None:
+        flags = CmdFlags()
+
     cmd = ["ssh"]
+
+    # Verbose mode (/v)
+    if flags.verbose:
+        cmd.append("-v")
 
     # Resolve effective values (per-host overrides global config)
     user     = entry.user     or config.ssh_user
@@ -192,7 +223,8 @@ def build_ssh_command(entry: HostEntry, config: Config) -> List[str]:
     jumpuser = entry.jumpuser or config.jumpuser
 
     # ProxyJump: handles banner + forwarding transparently
-    if jumphost:
+    # Skipped when /o (bypass_jumphost) flag is active
+    if jumphost and not flags.bypass_jumphost:
         jump_spec = f"{jumpuser}@{jumphost}" if jumpuser else jumphost
         cmd += ["-J", jump_spec]
 
@@ -206,6 +238,34 @@ def build_ssh_command(entry: HostEntry, config: Config) -> List[str]:
     cmd.append(target)
 
     return cmd
+
+
+# ── slash-command parser ───────────────────────────────────────────────────────
+def parse_command(text: str) -> tuple:
+    """Strip leading slash-command prefixes and return (host_text, CmdFlags).
+
+    Supported prefixes (stackable, e.g. '/o /v hostname'):
+      /o   bypass jumphost — connect directly
+      /v   verbose SSH (-v flag)
+      /d   dry run — print SSH command without connecting
+    """
+    flags = CmdFlags()
+    text = text.strip()
+
+    while True:
+        if text.startswith("/o"):
+            flags.bypass_jumphost = True
+            text = text[2:].lstrip()
+        elif text.startswith("/v"):
+            flags.verbose = True
+            text = text[2:].lstrip()
+        elif text.startswith("/d"):
+            flags.dry_run = True
+            text = text[2:].lstrip()
+        else:
+            break
+
+    return text.strip(), flags
 
 
 # ── UI rendering ───────────────────────────────────────────────────────────────
@@ -232,12 +292,17 @@ def _plain_display(entries: List[HostEntry], config: Config) -> None:
 
 
 def display_ui(entries: List[HostEntry], config: Config) -> None:
-    """Render the Claude Code-inspired header and host table."""
+    """Render the wizard banner, header, and host table."""
     if not RICH_OK:
         _plain_display(entries, config)
         return
 
     console = Console()
+    console.print()
+
+    # ── wizard banner ───────────────────────────────────────────────────────────
+    for line_text, line_style in _WIZARD_LINES:
+        console.print(f"[{line_style}]{line_text}[/{line_style}]")
     console.print()
 
     # ── header ─────────────────────────────────────────────────────────────────
@@ -294,31 +359,41 @@ def display_ui(entries: List[HostEntry], config: Config) -> None:
     console.print(
         "  [dim]Tab / type to autocomplete  ·  Enter to connect  ·  Ctrl+C to quit[/dim]"
     )
+    console.print(
+        "  [dim]/o direct  ·  /v verbose  ·  /d dry-run  (stackable, e.g. /o/v)[/dim]"
+    )
     console.print()
 
 
-def show_connect(cmd: List[str]) -> None:
+def show_connect(cmd: List[str], dry_run: bool = False) -> None:
     if not RICH_OK:
-        print(f"  Connecting: {' '.join(cmd)}\n")
+        prefix = "  [DRY RUN] " if dry_run else "  Connecting: "
+        print(f"{prefix}{' '.join(cmd)}\n")
         return
     console = Console()
     console.print()
-    label = Text("  Connecting: ", style="dim")
-    label.append(" ".join(cmd), style="cyan")
+    if dry_run:
+        label = Text("  Dry run:    ", style="bold yellow")
+        label.append(" ".join(cmd), style="yellow")
+    else:
+        label = Text("  Connecting: ", style="dim")
+        label.append(" ".join(cmd), style="cyan")
     console.print(label)
     console.print()
 
 
 # ── interactive prompt ─────────────────────────────────────────────────────────
-def run_prompt(entries: List[HostEntry]) -> str:
+def run_prompt(entries: List[HostEntry]) -> tuple:
+    """Show interactive prompt; returns (host_text, CmdFlags)."""
     host_names = [e.hostname for e in entries]
 
     if not PROMPT_OK:
         try:
-            return input(" > ").strip()
+            raw = input(" > ").strip()
         except (KeyboardInterrupt, EOFError):
             print()
             raise SystemExit(130)
+        return parse_command(raw)
 
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     HISTORY_FILE.touch(exist_ok=True)
@@ -326,14 +401,27 @@ def run_prompt(entries: List[HostEntry]) -> str:
     session: PromptSession = PromptSession(
         history=FileHistory(str(HISTORY_FILE)),
         auto_suggest=AutoSuggestFromHistory(),
-        style=Style.from_dict({"prompt": "cyan bold"}),
+        style=Style.from_dict({
+            "prompt":          "bold cyan",
+            "prompt.override": "bold fg:darkorange",
+        }),
     )
     completer = FuzzyWordCompleter(words=host_names, WORD=True)
+
+    def _dynamic_prompt():
+        """Return prompt tokens; turns orange when a slash command is active."""
+        try:
+            buf_text = get_app().current_buffer.text
+            if buf_text.startswith("/"):
+                return [("class:prompt.override", " ⚡ > ")]
+        except Exception:
+            pass
+        return [("class:prompt", " > ")]
 
     while True:
         try:
             text = session.prompt(
-                [("class:prompt", " > ")],
+                _dynamic_prompt,
                 completer=completer,
                 complete_while_typing=True,
             ).strip()
@@ -341,7 +429,7 @@ def run_prompt(entries: List[HostEntry]) -> str:
             print()
             raise SystemExit(130)
         if text:
-            return text
+            return parse_command(text)
 
 
 # ── host resolution ────────────────────────────────────────────────────────────
@@ -386,14 +474,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     display_ui(entries, config)
 
     # Get target (from CLI arg or interactive prompt)
-    target_text = args.host if args.host else run_prompt(entries)
+    if args.host:
+        target_text, flags = parse_command(args.host)
+        if not target_text:
+            target_text = args.host
+    else:
+        target_text, flags = run_prompt(entries)
+
     if not target_text:
         return 1
 
     entry = find_entry(target_text, entries)
-    cmd   = build_ssh_command(entry, config)
+    cmd   = build_ssh_command(entry, config, flags)
 
-    show_connect(cmd)
+    show_connect(cmd, dry_run=flags.dry_run)
+
+    if flags.dry_run:
+        return 0
 
     try:
         return subprocess.call(cmd)
