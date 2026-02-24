@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sshmngr - SSH connection helper with Claude Code-inspired terminal UI."""
+"""sshmngr - SSH connection helper."""
 from __future__ import annotations
 
 import configparser
@@ -7,9 +7,9 @@ import csv
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 # ── optional deps ──────────────────────────────────────────────────────────────
 try:
@@ -28,12 +28,13 @@ try:
     from prompt_toolkit.history import FileHistory
     from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
     from prompt_toolkit.styles import Style
+    from prompt_toolkit.key_binding import KeyBindings
     PROMPT_OK = True
 except ImportError:
     PROMPT_OK = False
 
 # ── constants ──────────────────────────────────────────────────────────────────
-VERSION = "0.7.0"
+VERSION = "0.8.4"
 
 _XDG        = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 CONFIG_DIR  = _XDG / "sshmngr"
@@ -41,17 +42,42 @@ HOSTS_CSV   = CONFIG_DIR / "hosts.csv"
 CONFIG_INI  = CONFIG_DIR / "config.ini"
 HISTORY_FILE = CONFIG_DIR / ".history"
 
+# ASCII wizard shown above the header
+_WIZARD_LINES = [
+    ("  *    ˙    *    ˙    *    ˙    *  ", "bold yellow"),
+    ("  ˙    *    ˙    *    ˙    *    ˙  ", "yellow"),
+    ("         /\\     /\\               ", "cyan"),
+    ("        /  \\___/  \\              ", "cyan"),
+    ("       / .-. . .-. \\             ", "cyan"),
+    ("      | ( o ) ( o ) |            ", "bold cyan"),
+    ("      |   \\ ~~~ /   |            ", "cyan"),
+    ("       \\   ~~~~~   /             ", "cyan"),
+    ("        \\_________/              ", "cyan"),
+    ("            |||||                ", "bold cyan"),
+    ("          __||_||__              ", "cyan"),
+]
+
+# Lines of UI chrome that surround the host rows (banner + header + table header/sep +
+# hint lines + scroll indicator + prompt).  Used to compute how many rows fit on screen.
+_UI_OVERHEAD = len(_WIZARD_LINES) + 12  # ≈ 23
+
+
+def _visible_count(term_height: int) -> int:
+    """Maximum host rows that fit alongside the UI chrome for the given terminal height."""
+    return max(3, term_height - _UI_OVERHEAD)
+
 
 # ── data structures ────────────────────────────────────────────────────────────
 @dataclass
 class HostEntry:
     hostname: str
-    host:     str = ""   # IP or FQDN to connect to
-    port:     int = 22
-    user:     str = ""   # per-host user override
-    jumphost: str = ""   # per-host jump server override
-    jumpuser: str = ""   # per-host jump user override
-    notes:    str = ""
+    host:     str  = ""    # IP or FQDN to connect to
+    port:     int  = 22
+    user:     str  = ""    # per-host user override
+    jumphost: str  = ""    # per-host jump server override
+    jumpuser: str  = ""    # per-host jump user override
+    notes:    str  = ""
+    legacy:   bool = False # enable legacy SSH compat for this host
 
 
 @dataclass
@@ -60,6 +86,15 @@ class Config:
     jumpserver:      str  = ""
     jumpuser:        str  = ""
     ssh_user:        str  = ""
+
+
+@dataclass
+class CmdFlags:
+    """Runtime flags set via slash commands at the prompt."""
+    bypass_jumphost: bool = False   # /o  — connect direct, skip all jump logic
+    verbose:         bool = False   # /v  — pass -v to ssh
+    dry_run:         bool = False   # /d  — print ssh command, do not connect
+    legacy:          bool = False   # /l  — enable legacy SSH compat (ssh-rsa etc.)
 
 
 # ── config / hosts loaders ─────────────────────────────────────────────────────
@@ -121,7 +156,7 @@ def load_hosts() -> List[HostEntry]:
         fieldnames = [h.strip().lower() for h in (reader.fieldnames or [])]
 
         if "hostname" in fieldnames:
-            # Full format: hostname,host,port,user,jumphost,jumpuser,notes
+            # Full format: hostname,host,port,user,jumphost,jumpuser,notes[,legacy]
             for raw_row in reader:
                 row = {k.strip().lower(): (v or "").strip() for k, v in raw_row.items() if k}
                 hostname = row.get("hostname", "")
@@ -131,6 +166,7 @@ def load_hosts() -> List[HostEntry]:
                     port = int(row.get("port") or "22")
                 except ValueError:
                     port = 22
+                legacy_val = row.get("legacy", "").lower()
                 entries.append(HostEntry(
                     hostname=hostname,
                     host=row.get("host", ""),
@@ -139,6 +175,29 @@ def load_hosts() -> List[HostEntry]:
                     jumphost=row.get("jumphost", ""),
                     jumpuser=row.get("jumpuser", ""),
                     notes=row.get("notes", ""),
+                    legacy=legacy_val in ("yes", "true", "1"),
+                ))
+        elif "name" in fieldnames and "ip address" in fieldnames:
+            # Name + IP Address required; port/user/jumphost/jumpuser/notes optional
+            for raw_row in reader:
+                row = {k.strip().lower(): (v or "").strip() for k, v in raw_row.items() if k}
+                hostname = row.get("name", "")
+                if not hostname or hostname.startswith("#"):
+                    continue
+                try:
+                    port = int(row.get("port") or "22")
+                except ValueError:
+                    port = 22
+                legacy_val = row.get("legacy", "").lower()
+                entries.append(HostEntry(
+                    hostname=hostname,
+                    host=row.get("ip address", ""),
+                    port=port,
+                    user=row.get("user", ""),
+                    jumphost=row.get("jumphost", ""),
+                    jumpuser=row.get("jumpuser", ""),
+                    notes=row.get("notes", ""),
+                    legacy=legacy_val in ("yes", "true", "1"),
                 ))
         elif "host" in fieldnames and "addr" in fieldnames:
             # Two-column shorthand: host (alias/name), addr (IP)
@@ -178,13 +237,27 @@ def load_hosts() -> List[HostEntry]:
 
 
 # ── SSH command builder ────────────────────────────────────────────────────────
-def build_ssh_command(entry: HostEntry, config: Config) -> List[str]:
+def build_ssh_command(entry: HostEntry, config: Config, flags: Optional[CmdFlags] = None) -> List[str]:
     """Build SSH command using ProxyJump (-J) for jump hosts.
 
     System SSH with -J handles SSH banners from the target host natively,
     avoiding the 'Error reading SSH protocol banner' that occurs with paramiko.
     """
+    if flags is None:
+        flags = CmdFlags()
+
     cmd = ["ssh"]
+
+    # Verbose mode (/v)
+    if flags.verbose:
+        cmd.append("-v")
+
+    # Legacy mode (/l or per-host): re-enable ssh-rsa for old servers
+    if flags.legacy:
+        cmd += [
+            "-o", "HostKeyAlgorithms=+ssh-rsa",
+            "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+        ]
 
     # Resolve effective values (per-host overrides global config)
     user     = entry.user     or config.ssh_user
@@ -192,7 +265,8 @@ def build_ssh_command(entry: HostEntry, config: Config) -> List[str]:
     jumpuser = entry.jumpuser or config.jumpuser
 
     # ProxyJump: handles banner + forwarding transparently
-    if jumphost:
+    # Skipped when /o (bypass_jumphost) flag is active
+    if jumphost and not flags.bypass_jumphost:
         jump_spec = f"{jumpuser}@{jumphost}" if jumpuser else jumphost
         cmd += ["-J", jump_spec]
 
@@ -206,6 +280,38 @@ def build_ssh_command(entry: HostEntry, config: Config) -> List[str]:
     cmd.append(target)
 
     return cmd
+
+
+# ── slash-command parser ───────────────────────────────────────────────────────
+def parse_command(text: str) -> tuple:
+    """Strip leading slash-command prefixes and return (host_text, CmdFlags).
+
+    Supported prefixes (stackable, e.g. '/o /v hostname'):
+      /o   bypass jumphost — connect directly
+      /v   verbose SSH (-v flag)
+      /d   dry run — print SSH command without connecting
+      /l   legacy mode — re-enable ssh-rsa for old servers
+    """
+    flags = CmdFlags()
+    text = text.strip()
+
+    while True:
+        if text.startswith("/o"):
+            flags.bypass_jumphost = True
+            text = text[2:].lstrip()
+        elif text.startswith("/v"):
+            flags.verbose = True
+            text = text[2:].lstrip()
+        elif text.startswith("/d"):
+            flags.dry_run = True
+            text = text[2:].lstrip()
+        elif text.startswith("/l"):
+            flags.legacy = True
+            text = text[2:].lstrip()
+        else:
+            break
+
+    return text.strip(), flags
 
 
 # ── UI rendering ───────────────────────────────────────────────────────────────
@@ -231,13 +337,27 @@ def _plain_display(entries: List[HostEntry], config: Config) -> None:
     print()
 
 
-def display_ui(entries: List[HostEntry], config: Config) -> None:
-    """Render the Claude Code-inspired header and host table."""
+def display_ui(
+    entries: List[HostEntry],
+    config: Config,
+    scroll_offset: int = 0,
+    total_count: Optional[int] = None,
+) -> None:
+    """Render the wizard banner, header, and host table.
+
+    When *total_count* is given and greater than len(entries), the table shows
+    only the current slice and a scroll indicator is appended to the hint line.
+    """
     if not RICH_OK:
         _plain_display(entries, config)
         return
 
     console = Console()
+    console.print()
+
+    # ── wizard banner ───────────────────────────────────────────────────────────
+    for line_text, line_style in _WIZARD_LINES:
+        console.print(f"[{line_style}]{line_text}[/{line_style}]")
     console.print()
 
     # ── header ─────────────────────────────────────────────────────────────────
@@ -294,54 +414,158 @@ def display_ui(entries: List[HostEntry], config: Config) -> None:
     console.print(
         "  [dim]Tab / type to autocomplete  ·  Enter to connect  ·  Ctrl+C to quit[/dim]"
     )
+    console.print(
+        "  [dim]/o direct  ·  /v verbose  ·  /d dry-run  ·  /l legacy  (stackable, e.g. /o/v)[/dim]"
+    )
+    if total_count is not None and total_count > len(entries):
+        end = scroll_offset + len(entries)
+        console.print(
+            f"  [dim]↑ ↓ to scroll  [{scroll_offset + 1}–{end} of {total_count}][/dim]"
+        )
     console.print()
 
 
-def show_connect(cmd: List[str]) -> None:
+def show_connect(cmd: List[str], dry_run: bool = False) -> None:
     if not RICH_OK:
-        print(f"  Connecting: {' '.join(cmd)}\n")
+        prefix = "  [DRY RUN] " if dry_run else "  Connecting: "
+        print(f"{prefix}{' '.join(cmd)}\n")
         return
     console = Console()
     console.print()
-    label = Text("  Connecting: ", style="dim")
-    label.append(" ".join(cmd), style="cyan")
+    if dry_run:
+        label = Text("  Dry run:    ", style="bold yellow")
+        label.append(" ".join(cmd), style="yellow")
+    else:
+        label = Text("  Connecting: ", style="dim")
+        label.append(" ".join(cmd), style="cyan")
     console.print(label)
     console.print()
 
 
 # ── interactive prompt ─────────────────────────────────────────────────────────
-def run_prompt(entries: List[HostEntry]) -> str:
+def run_prompt(entries: List[HostEntry], config: Config) -> tuple:
+    """Show interactive prompt; returns (host_text, CmdFlags).
+
+    WoW-chat-inspired slash commands: type /o (or /v, /d, /l) then press Space.
+    The prefix vanishes from the buffer, the prompt turns orange, and you type
+    the hostname normally with full fuzzy autocomplete still active.
+    Commands accumulate — e.g. /o<space>/v<space> activates both.
+
+    Up/Down arrows scroll the host list when it does not fit on screen.
+    """
     host_names = [e.hostname for e in entries]
 
     if not PROMPT_OK:
         try:
-            return input(" > ").strip()
+            raw = input(" > ").strip()
         except (KeyboardInterrupt, EOFError):
             print()
             raise SystemExit(130)
+        return parse_command(raw)
 
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     HISTORY_FILE.touch(exist_ok=True)
 
+    # ── scroll state ────────────────────────────────────────────────────────────
+    try:
+        term_h = os.get_terminal_size().lines
+    except OSError:
+        term_h = 40
+    vis   = _visible_count(term_h)
+    total = len(entries)
+    needs_scroll = RICH_OK and total > vis
+    _offset: List[int] = [0]
+
+    def _redraw() -> None:
+        Console().clear()
+        display_ui(
+            entries[_offset[0]:_offset[0] + vis],
+            config,
+            scroll_offset=_offset[0],
+            total_count=total,
+        )
+
+    # Mutable mode state shared between key binding and prompt callable
+    _mode: Dict[str, bool] = {
+        "bypass_jumphost": False,
+        "verbose":         False,
+        "dry_run":         False,
+        "legacy":          False,
+    }
+
+    _CMD_MAP = {"/o": "bypass_jumphost", "/v": "verbose", "/d": "dry_run", "/l": "legacy"}
+
+    kb = KeyBindings()
+
+    @kb.add(" ")
+    def _on_space(event):
+        """Activate a slash command on Space, WoW-style; otherwise insert space."""
+        buf  = event.app.current_buffer
+        text = buf.text  # what the user has typed so far
+
+        if text in _CMD_MAP:
+            _mode[_CMD_MAP[text]] = True
+            buf.reset()               # wipe the /o (or /v, /d) from the buffer
+            event.app.invalidate()    # redraw prompt immediately
+        else:
+            buf.insert_text(" ")
+
+    if needs_scroll:
+        @kb.add("up", eager=True)
+        def _scroll_up(event):
+            if _offset[0] > 0:
+                _offset[0] -= 1
+                event.app.run_in_terminal(_redraw)
+
+        @kb.add("down", eager=True)
+        def _scroll_down(event):
+            if _offset[0] + vis < total:
+                _offset[0] += 1
+                event.app.run_in_terminal(_redraw)
+
+    def _dynamic_prompt():
+        """Prompt label; turns orange with a mode tag when any command is active."""
+        if any(_mode.values()):
+            tag = "/".join(k for k, v in zip(("o", "v", "d", "l"), _mode.values()) if v)
+            return [("class:prompt.override", f" /{tag} > ")]
+        return [("class:prompt", " > ")]
+
     session: PromptSession = PromptSession(
         history=FileHistory(str(HISTORY_FILE)),
         auto_suggest=AutoSuggestFromHistory(),
-        style=Style.from_dict({"prompt": "cyan bold"}),
+        style=Style.from_dict({
+            "prompt":          "bold cyan",
+            "prompt.override": "bold fg:darkorange",
+        }),
+        key_bindings=kb,
     )
     completer = FuzzyWordCompleter(words=host_names, WORD=True)
 
     while True:
+        # Reset mode at the start of each prompt so each connection starts clean
+        for k in _mode:
+            _mode[k] = False
+
         try:
             text = session.prompt(
-                [("class:prompt", " > ")],
+                _dynamic_prompt,
                 completer=completer,
                 complete_while_typing=True,
             ).strip()
         except (KeyboardInterrupt, EOFError):
             print()
             raise SystemExit(130)
+
         if text:
-            return text
+            # Also support typed slash prefixes (e.g. from CLI args or old habit)
+            host_text, typed_flags = parse_command(text)
+            flags = CmdFlags(
+                bypass_jumphost=_mode["bypass_jumphost"] or typed_flags.bypass_jumphost,
+                verbose        =_mode["verbose"]         or typed_flags.verbose,
+                dry_run        =_mode["dry_run"]         or typed_flags.dry_run,
+                legacy         =_mode["legacy"]          or typed_flags.legacy,
+            )
+            return host_text or text, flags
 
 
 # ── host resolution ────────────────────────────────────────────────────────────
@@ -382,26 +606,57 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(e.hostname)
         return 0
 
-    # Render TUI
-    display_ui(entries, config)
-
-    # Get target (from CLI arg or interactive prompt)
-    target_text = args.host if args.host else run_prompt(entries)
-    if not target_text:
-        return 1
-
-    entry = find_entry(target_text, entries)
-    cmd   = build_ssh_command(entry, config)
-
-    show_connect(cmd)
-
+    # Compute scroll geometry once (terminal height doesn't change mid-session)
     try:
-        return subprocess.call(cmd)
-    except FileNotFoundError:
-        print("Error: 'ssh' not found in PATH.", file=sys.stderr)
-        return 127
-    except KeyboardInterrupt:
-        return 130
+        term_h = os.get_terminal_size().lines
+    except OSError:
+        term_h = 40
+    vis = _visible_count(term_h)
+    needs_scroll = RICH_OK and PROMPT_OK and len(entries) > vis
+
+    # first_host: use the CLI arg on the very first iteration, then None forever after
+    first_host: Optional[str] = args.host
+
+    # Main loop — re-render TUI and re-prompt after every SSH session ends
+    while True:
+        display_ui(
+            entries[:vis] if needs_scroll else entries,
+            config,
+            scroll_offset=0,
+            total_count=len(entries) if needs_scroll else None,
+        )
+
+        # Get target (from CLI arg on first iteration, interactive prompt thereafter)
+        if first_host is not None:
+            target_text, flags = parse_command(first_host)
+            if not target_text:
+                target_text = first_host
+            first_host = None
+        else:
+            target_text, flags = run_prompt(entries, config)
+
+        if not target_text:
+            continue
+
+        entry = find_entry(target_text, entries)
+        # Per-host legacy flag takes effect even without /l at the prompt
+        if entry.legacy:
+            flags.legacy = True
+        cmd = build_ssh_command(entry, config, flags)
+
+        show_connect(cmd, dry_run=flags.dry_run)
+
+        if flags.dry_run:
+            continue
+
+        try:
+            subprocess.call(cmd)
+        except FileNotFoundError:
+            print("Error: 'ssh' not found in PATH.", file=sys.stderr)
+            return 127
+        except KeyboardInterrupt:
+            pass
+        # SSH session ended — loop back to TUI
 
 
 if __name__ == "__main__":

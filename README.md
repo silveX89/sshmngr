@@ -1,8 +1,8 @@
 # SSHMngr
 
-A tiny SSH connection manager with a rich terminal UI, fuzzy autocomplete, and optional jump host support — driven by a simple CSV inventory.
+A tiny SSH connection manager with a rich terminal UI, ASCII wizard banner, fuzzy autocomplete, and optional jump host support — driven by a simple CSV inventory.
 
-**v0.7.0** — replaces the old paramiko-based TUI with system `ssh` + [`rich`](https://github.com/Textualize/rich) + [`prompt_toolkit`](https://github.com/prompt-toolkit/python-prompt-toolkit).
+**v0.8.0** — adds an ASCII wizard banner and an in-prompt slash-command system (`/o`, `/v`, `/d`).
 
 ---
 
@@ -17,7 +17,7 @@ pip install -e .          # editable install — picks up changes without reinst
 This exposes the `sshmngr` command on your PATH (within the venv).
 
 **Dependencies** (installed automatically by pip):
-- `rich >= 13.0` — terminal table and header rendering
+- `rich >= 13.0` — terminal table, header, and wizard banner rendering
 - `prompt_toolkit >= 3.0.43` — fuzzy autocomplete and input history
 
 Both are optional — the tool degrades to a plain `input()` prompt if either is missing.
@@ -32,7 +32,7 @@ sshmngr <hostname>        # connect directly, skipping the prompt
 sshmngr --list-hosts      # print all known hostnames (used by bash completion)
 ```
 
-The TUI shows a table of all hosts and prompts for a hostname. Tab-complete or type a prefix to filter. Press **Enter** to connect, **Ctrl+C** to quit.
+The TUI shows a wizard banner, a table of all hosts, and prompts for a hostname. Tab-complete or type a prefix to filter. Press **Enter** to connect, **Ctrl+C** to quit.
 
 ### Bash completion (optional, one-time)
 
@@ -41,6 +41,28 @@ source completions/sshmngr.bash
 ```
 
 Add that line to your `~/.bashrc` for persistent completion.
+
+---
+
+## Slash commands
+
+Type a slash command **before** the hostname to modify how the connection is made. The prompt turns **orange** whenever a slash command is active. Commands are stackable.
+
+| Command | Effect |
+|---------|--------|
+| `/o` | **Bypass jumphost** — connect directly, ignoring `global_jumphost` and per-host jump config |
+| `/v` | **Verbose** — passes `-v` to `ssh` for connection debugging |
+| `/d` | **Dry run** — prints the SSH command that *would* run, without connecting |
+
+**Examples:**
+
+```
+ ⚡ > /o myserver          # connect to myserver directly (no jump)
+ ⚡ > /v myserver          # connect with verbose SSH output
+ ⚡ > /d myserver          # show the ssh command without running it
+ ⚡ > /o/v myserver        # direct + verbose (stackable)
+ ⚡ > /d/o myserver        # dry-run of a direct connection
+```
 
 ---
 
@@ -119,7 +141,7 @@ sshmngr delegates entirely to system `ssh`, using `-J` (ProxyJump) for jump host
 ssh -J jumpadmin@jumpserver ubuntu@192.0.2.10
 ```
 
-This handles SSH banners and host key checks natively, without any Python SSH library.
+This handles SSH banners and host key checks natively, without any Python SSH library. Use `/o` at the prompt to bypass the jump host for a single connection.
 
 **Host resolution order** (when you type a name at the prompt):
 1. Exact `hostname` match
