@@ -28,7 +28,7 @@ All logic lives in a single file: `sshmngr/sshmngr.py`.
 **Data flow:**
 1. `load_config()` reads `config.ini` → `Config` dataclass
 2. `load_hosts()` reads `hosts.csv` → list of `HostEntry` dataclasses
-3. `display_ui()` renders header + host table via `rich`
+3. `display_ui()` renders wizard banner + host table via `rich`
 4. `run_prompt()` presents a `prompt_toolkit` fuzzy-autocomplete prompt
 5. `find_entry()` resolves the typed string to a `HostEntry`
 6. `build_ssh_command()` constructs the `ssh` command list
@@ -36,24 +36,36 @@ All logic lives in a single file: `sshmngr/sshmngr.py`.
 
 **Config file search order:** CWD first, then `~/.config/sshmngr/`. This allows per-project configs by running `sshmngr` from a directory containing its own `config.ini` / `hosts.csv`.
 
-**SSH banner fix:** System SSH is used with `-J` (ProxyJump) instead of paramiko. This handles SSH banners from target hosts natively. The generated command looks like:
-```
-ssh -J jumpuser@jumpserver user@target-ip
-```
-
 **`hosts.csv` format detection** (in `load_hosts`):
 - Header contains `hostname` → full format (`hostname,host,port,user,jumphost,jumpuser,notes[,legacy]`)
-- Header contains `name` + `ip address` → XIQ-SE export format; optional columns: `port`, `user`, `jumphost`, `jumpuser`, `notes`, `legacy`; all other columns ignored
+- Header contains `name` + `ip address` → maps `Name`→hostname, `IP Address`→host; optional columns: `port`, `user`, `jumphost`, `jumpuser`, `notes`, `legacy`; all other columns ignored
 - Header contains `host` + `addr` → two-column shorthand
 - Any other header → first col = hostname, second col = IP
 - No header → raw hostnames, one per line
 
 **`config.ini`** has no `[section]` header — `_preprocess_ini()` injects `[main]` before passing to `configparser`. Keys: `global_jumphost` (yes/no), `jumpserver`, `jumpuser`, `ssh_user`.
 
+**Slash-command system** (`CmdFlags` dataclass + `parse_command()`):
+
+| Flag | `CmdFlags` field | SSH effect |
+|------|-----------------|------------|
+| `/o` | `bypass_jumphost` | Omits `-J` jump spec entirely |
+| `/v` | `verbose` | Adds `-v` to ssh |
+| `/d` | `dry_run` | Prints command, skips `subprocess.call` |
+| `/l` | `legacy` | Adds `-o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedAlgorithms=+ssh-rsa` |
+
+Commands are stackable (e.g. `/l/v hostname`). In `run_prompt()` the WoW-style activation fires on **Space** after typing the prefix — `_CMD_MAP` maps each prefix string to the matching `_mode` key. The `_dynamic_prompt()` callable rebuilds the prompt label whenever a mode is active.
+
+The `legacy` flag can also be set **per-host** via a `legacy=yes` column in `hosts.csv` (full or XIQ-SE format). `main()` merges `entry.legacy` into `flags.legacy` before calling `build_ssh_command()`.
+
 **`find_entry()` resolution order:** exact hostname → unique prefix → exact IP/host → literal fallback (passed raw to `ssh`).
 
-**Dependencies:** `rich` (display), `prompt_toolkit` (interactive prompt). Both are optional — the code degrades gracefully if either is missing (`RICH_OK` / `PROMPT_OK` flags). Without `prompt_toolkit`, falls back to plain `input()`.
+**Dependencies:** `rich` (display), `prompt_toolkit` (interactive prompt). Both optional — degrades gracefully if missing (`RICH_OK` / `PROMPT_OK` flags). Without `prompt_toolkit`, falls back to plain `input()`.
 
-**Entry point:** `sshmngr.sshmngr:main` as defined in `pyproject.toml`. Version string is `VERSION` at the top of `sshmngr.py`; update both it and `pyproject.toml` when bumping.
+**Version string** lives in two places — keep them in sync when bumping:
+- `VERSION` constant at the top of `sshmngr/sshmngr.py`
+- `version` field in `pyproject.toml`
 
-**History file:** `~/.config/sshmngr/.history` (prompt_toolkit FileHistory).
+**Entry point:** `sshmngr.sshmngr:main` as defined in `pyproject.toml`.
+
+**History file:** `~/.config/sshmngr/.history` (prompt_toolkit `FileHistory`).
