@@ -34,7 +34,7 @@ except ImportError:
     PROMPT_OK = False
 
 # ── constants ──────────────────────────────────────────────────────────────────
-VERSION = "0.8.2"
+VERSION = "0.8.3"
 
 _XDG        = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 CONFIG_DIR  = _XDG / "sshmngr"
@@ -147,7 +147,7 @@ def load_hosts() -> List[HostEntry]:
         fieldnames = [h.strip().lower() for h in (reader.fieldnames or [])]
 
         if "hostname" in fieldnames:
-            # Full format: hostname,host,port,user,jumphost,jumpuser,notes
+            # Full format: hostname,host,port,user,jumphost,jumpuser,notes[,legacy]
             for raw_row in reader:
                 row = {k.strip().lower(): (v or "").strip() for k, v in raw_row.items() if k}
                 hostname = row.get("hostname", "")
@@ -161,6 +161,28 @@ def load_hosts() -> List[HostEntry]:
                 entries.append(HostEntry(
                     hostname=hostname,
                     host=row.get("host", ""),
+                    port=port,
+                    user=row.get("user", ""),
+                    jumphost=row.get("jumphost", ""),
+                    jumpuser=row.get("jumpuser", ""),
+                    notes=row.get("notes", ""),
+                    legacy=legacy_val in ("yes", "true", "1"),
+                ))
+        elif "name" in fieldnames and "ip address" in fieldnames:
+            # XIQ-SE export format: Name + IP Address required; port/user/jumphost/jumpuser/notes optional
+            for raw_row in reader:
+                row = {k.strip().lower(): (v or "").strip() for k, v in raw_row.items() if k}
+                hostname = row.get("name", "")
+                if not hostname or hostname.startswith("#"):
+                    continue
+                try:
+                    port = int(row.get("port") or "22")
+                except ValueError:
+                    port = 22
+                legacy_val = row.get("legacy", "").lower()
+                entries.append(HostEntry(
+                    hostname=hostname,
+                    host=row.get("ip address", ""),
                     port=port,
                     user=row.get("user", ""),
                     jumphost=row.get("jumphost", ""),

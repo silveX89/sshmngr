@@ -42,7 +42,8 @@ ssh -J jumpuser@jumpserver user@target-ip
 ```
 
 **`hosts.csv` format detection** (in `load_hosts`):
-- Header contains `hostname` → full format (`hostname,host,port,user,jumphost,jumpuser,notes`)
+- Header contains `hostname` → full format (`hostname,host,port,user,jumphost,jumpuser,notes[,legacy]`)
+- Header contains `name` + `ip address` → XIQ-SE export format; optional columns: `port`, `user`, `jumphost`, `jumpuser`, `notes`, `legacy`; all other columns ignored
 - Header contains `host` + `addr` → two-column shorthand
 - Any other header → first col = hostname, second col = IP
 - No header → raw hostnames, one per line
