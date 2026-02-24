@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sshmngr - SSH connection helper with Claude Code-inspired terminal UI."""
+"""sshmngr - SSH connection helper."""
 from __future__ import annotations
 
 import configparser
@@ -169,7 +169,7 @@ def load_hosts() -> List[HostEntry]:
                     legacy=legacy_val in ("yes", "true", "1"),
                 ))
         elif "name" in fieldnames and "ip address" in fieldnames:
-            # XIQ-SE export format: Name + IP Address required; port/user/jumphost/jumpuser/notes optional
+            # Name + IP Address required; port/user/jumphost/jumpuser/notes optional
             for raw_row in reader:
                 row = {k.strip().lower(): (v or "").strip() for k, v in raw_row.items() if k}
                 hostname = row.get("name", "")
