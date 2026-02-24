@@ -606,49 +606,57 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(e.hostname)
         return 0
 
-    # Render TUI — show only the visible slice when the list is longer than the screen
+    # Compute scroll geometry once (terminal height doesn't change mid-session)
     try:
         term_h = os.get_terminal_size().lines
     except OSError:
         term_h = 40
     vis = _visible_count(term_h)
     needs_scroll = RICH_OK and PROMPT_OK and len(entries) > vis
-    display_ui(
-        entries[:vis] if needs_scroll else entries,
-        config,
-        scroll_offset=0,
-        total_count=len(entries) if needs_scroll else None,
-    )
 
-    # Get target (from CLI arg or interactive prompt)
-    if args.host:
-        target_text, flags = parse_command(args.host)
+    # first_host: use the CLI arg on the very first iteration, then None forever after
+    first_host: Optional[str] = args.host
+
+    # Main loop — re-render TUI and re-prompt after every SSH session ends
+    while True:
+        display_ui(
+            entries[:vis] if needs_scroll else entries,
+            config,
+            scroll_offset=0,
+            total_count=len(entries) if needs_scroll else None,
+        )
+
+        # Get target (from CLI arg on first iteration, interactive prompt thereafter)
+        if first_host is not None:
+            target_text, flags = parse_command(first_host)
+            if not target_text:
+                target_text = first_host
+            first_host = None
+        else:
+            target_text, flags = run_prompt(entries, config)
+
         if not target_text:
-            target_text = args.host
-    else:
-        target_text, flags = run_prompt(entries, config)
+            continue
 
-    if not target_text:
-        return 1
+        entry = find_entry(target_text, entries)
+        # Per-host legacy flag takes effect even without /l at the prompt
+        if entry.legacy:
+            flags.legacy = True
+        cmd = build_ssh_command(entry, config, flags)
 
-    entry = find_entry(target_text, entries)
-    # Per-host legacy flag takes effect even without /l at the prompt
-    if entry.legacy:
-        flags.legacy = True
-    cmd   = build_ssh_command(entry, config, flags)
+        show_connect(cmd, dry_run=flags.dry_run)
 
-    show_connect(cmd, dry_run=flags.dry_run)
+        if flags.dry_run:
+            continue
 
-    if flags.dry_run:
-        return 0
-
-    try:
-        return subprocess.call(cmd)
-    except FileNotFoundError:
-        print("Error: 'ssh' not found in PATH.", file=sys.stderr)
-        return 127
-    except KeyboardInterrupt:
-        return 130
+        try:
+            subprocess.call(cmd)
+        except FileNotFoundError:
+            print("Error: 'ssh' not found in PATH.", file=sys.stderr)
+            return 127
+        except KeyboardInterrupt:
+            pass
+        # SSH session ended — loop back to TUI
 
 
 if __name__ == "__main__":
