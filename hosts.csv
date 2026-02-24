@@ -1,0 +1,6 @@
+hostname,host,port,user,jumphost,jumpuser,notes,legacy
+webserver,10.0.1.10,,,,,
+database,10.0.1.20,,,,,
+nas,10.0.1.30,,admin,,,
+firewall,fw.example.net,2222,admin,jump.example.net,juser,"mgmt via non-std port",
+legacy-device,10.0.2.50,,,,,old SSH server (ssh-rsa only),yes

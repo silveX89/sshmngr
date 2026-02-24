@@ -34,7 +34,7 @@ except ImportError:
     PROMPT_OK = False
 
 # ── constants ──────────────────────────────────────────────────────────────────
-VERSION = "0.8.1"
+VERSION = "0.8.2"
 
 _XDG        = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 CONFIG_DIR  = _XDG / "sshmngr"
@@ -62,12 +62,13 @@ _WIZARD_LINES = [
 @dataclass
 class HostEntry:
     hostname: str
-    host:     str = ""   # IP or FQDN to connect to
-    port:     int = 22
-    user:     str = ""   # per-host user override
-    jumphost: str = ""   # per-host jump server override
-    jumpuser: str = ""   # per-host jump user override
-    notes:    str = ""
+    host:     str  = ""    # IP or FQDN to connect to
+    port:     int  = 22
+    user:     str  = ""    # per-host user override
+    jumphost: str  = ""    # per-host jump server override
+    jumpuser: str  = ""    # per-host jump user override
+    notes:    str  = ""
+    legacy:   bool = False # enable legacy SSH compat for this host
 
 
 @dataclass
@@ -84,6 +85,7 @@ class CmdFlags:
     bypass_jumphost: bool = False   # /o  — connect direct, skip all jump logic
     verbose:         bool = False   # /v  — pass -v to ssh
     dry_run:         bool = False   # /d  — print ssh command, do not connect
+    legacy:          bool = False   # /l  — enable legacy SSH compat (ssh-rsa etc.)
 
 
 # ── config / hosts loaders ─────────────────────────────────────────────────────
@@ -155,6 +157,7 @@ def load_hosts() -> List[HostEntry]:
                     port = int(row.get("port") or "22")
                 except ValueError:
                     port = 22
+                legacy_val = row.get("legacy", "").lower()
                 entries.append(HostEntry(
                     hostname=hostname,
                     host=row.get("host", ""),
@@ -163,6 +166,7 @@ def load_hosts() -> List[HostEntry]:
                     jumphost=row.get("jumphost", ""),
                     jumpuser=row.get("jumpuser", ""),
                     notes=row.get("notes", ""),
+                    legacy=legacy_val in ("yes", "true", "1"),
                 ))
         elif "host" in fieldnames and "addr" in fieldnames:
             # Two-column shorthand: host (alias/name), addr (IP)
@@ -217,6 +221,13 @@ def build_ssh_command(entry: HostEntry, config: Config, flags: Optional[CmdFlags
     if flags.verbose:
         cmd.append("-v")
 
+    # Legacy mode (/l or per-host): re-enable ssh-rsa for old servers
+    if flags.legacy:
+        cmd += [
+            "-o", "HostKeyAlgorithms=+ssh-rsa",
+            "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+        ]
+
     # Resolve effective values (per-host overrides global config)
     user     = entry.user     or config.ssh_user
     jumphost = entry.jumphost or (config.jumpserver if config.global_jumphost else "")
@@ -248,6 +259,7 @@ def parse_command(text: str) -> tuple:
       /o   bypass jumphost — connect directly
       /v   verbose SSH (-v flag)
       /d   dry run — print SSH command without connecting
+      /l   legacy mode — re-enable ssh-rsa for old servers
     """
     flags = CmdFlags()
     text = text.strip()
@@ -261,6 +273,9 @@ def parse_command(text: str) -> tuple:
             text = text[2:].lstrip()
         elif text.startswith("/d"):
             flags.dry_run = True
+            text = text[2:].lstrip()
+        elif text.startswith("/l"):
+            flags.legacy = True
             text = text[2:].lstrip()
         else:
             break
@@ -360,7 +375,7 @@ def display_ui(entries: List[HostEntry], config: Config) -> None:
         "  [dim]Tab / type to autocomplete  ·  Enter to connect  ·  Ctrl+C to quit[/dim]"
     )
     console.print(
-        "  [dim]/o direct  ·  /v verbose  ·  /d dry-run  (stackable, e.g. /o/v)[/dim]"
+        "  [dim]/o direct  ·  /v verbose  ·  /d dry-run  ·  /l legacy  (stackable, e.g. /o/v)[/dim]"
     )
     console.print()
 
@@ -409,9 +424,10 @@ def run_prompt(entries: List[HostEntry]) -> tuple:
         "bypass_jumphost": False,
         "verbose":         False,
         "dry_run":         False,
+        "legacy":          False,
     }
 
-    _CMD_MAP = {"/o": "bypass_jumphost", "/v": "verbose", "/d": "dry_run"}
+    _CMD_MAP = {"/o": "bypass_jumphost", "/v": "verbose", "/d": "dry_run", "/l": "legacy"}
 
     kb = KeyBindings()
 
@@ -431,7 +447,7 @@ def run_prompt(entries: List[HostEntry]) -> tuple:
     def _dynamic_prompt():
         """Prompt label; turns orange with a mode tag when any command is active."""
         if any(_mode.values()):
-            tag = "/".join(k for k, v in zip(("o", "v", "d"), _mode.values()) if v)
+            tag = "/".join(k for k, v in zip(("o", "v", "d", "l"), _mode.values()) if v)
             return [("class:prompt.override", f" /{tag} > ")]
         return [("class:prompt", " > ")]
 
@@ -468,6 +484,7 @@ def run_prompt(entries: List[HostEntry]) -> tuple:
                 bypass_jumphost=_mode["bypass_jumphost"] or typed_flags.bypass_jumphost,
                 verbose        =_mode["verbose"]         or typed_flags.verbose,
                 dry_run        =_mode["dry_run"]         or typed_flags.dry_run,
+                legacy         =_mode["legacy"]          or typed_flags.legacy,
             )
             return host_text or text, flags
 
@@ -525,6 +542,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     entry = find_entry(target_text, entries)
+    # Per-host legacy flag takes effect even without /l at the prompt
+    if entry.legacy:
+        flags.legacy = True
     cmd   = build_ssh_command(entry, config, flags)
 
     show_connect(cmd, dry_run=flags.dry_run)
