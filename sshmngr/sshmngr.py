@@ -34,7 +34,7 @@ except ImportError:
     PROMPT_OK = False
 
 # ── constants ──────────────────────────────────────────────────────────────────
-VERSION = "0.8.4"
+VERSION = "0.8.5"
 
 _XDG        = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
 CONFIG_DIR  = _XDG / "sshmngr"
@@ -56,16 +56,6 @@ _WIZARD_LINES = [
     ("            |||||                ", "bold cyan"),
     ("          __||_||__              ", "cyan"),
 ]
-
-# Lines of UI chrome that surround the host rows (banner + header + table header/sep +
-# hint lines + scroll indicator + prompt).  Used to compute how many rows fit on screen.
-_UI_OVERHEAD = len(_WIZARD_LINES) + 12  # ≈ 23
-
-
-def _visible_count(term_height: int) -> int:
-    """Maximum host rows that fit alongside the UI chrome for the given terminal height."""
-    return max(3, term_height - _UI_OVERHEAD)
-
 
 # ── data structures ────────────────────────────────────────────────────────────
 @dataclass
@@ -337,17 +327,8 @@ def _plain_display(entries: List[HostEntry], config: Config) -> None:
     print()
 
 
-def display_ui(
-    entries: List[HostEntry],
-    config: Config,
-    scroll_offset: int = 0,
-    total_count: Optional[int] = None,
-) -> None:
-    """Render the wizard banner, header, and host table.
-
-    When *total_count* is given and greater than len(entries), the table shows
-    only the current slice and a scroll indicator is appended to the hint line.
-    """
+def display_ui(entries: List[HostEntry], config: Config) -> None:
+    """Render the wizard banner, header, and host table."""
     if not RICH_OK:
         _plain_display(entries, config)
         return
@@ -417,11 +398,6 @@ def display_ui(
     console.print(
         "  [dim]/o direct  ·  /v verbose  ·  /d dry-run  ·  /l legacy  (stackable, e.g. /o/v)[/dim]"
     )
-    if total_count is not None and total_count > len(entries):
-        end = scroll_offset + len(entries)
-        console.print(
-            f"  [dim]↑ ↓ to scroll  [{scroll_offset + 1}–{end} of {total_count}][/dim]"
-        )
     console.print()
 
 
@@ -450,8 +426,6 @@ def run_prompt(entries: List[HostEntry], config: Config) -> tuple:
     The prefix vanishes from the buffer, the prompt turns orange, and you type
     the hostname normally with full fuzzy autocomplete still active.
     Commands accumulate — e.g. /o<space>/v<space> activates both.
-
-    Up/Down arrows scroll the host list when it does not fit on screen.
     """
     host_names = [e.hostname for e in entries]
 
@@ -465,25 +439,6 @@ def run_prompt(entries: List[HostEntry], config: Config) -> tuple:
 
     HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     HISTORY_FILE.touch(exist_ok=True)
-
-    # ── scroll state ────────────────────────────────────────────────────────────
-    try:
-        term_h = os.get_terminal_size().lines
-    except OSError:
-        term_h = 40
-    vis   = _visible_count(term_h)
-    total = len(entries)
-    needs_scroll = RICH_OK and total > vis
-    _offset: List[int] = [0]
-
-    def _redraw() -> None:
-        Console().clear()
-        display_ui(
-            entries[_offset[0]:_offset[0] + vis],
-            config,
-            scroll_offset=_offset[0],
-            total_count=total,
-        )
 
     # Mutable mode state shared between key binding and prompt callable
     _mode: Dict[str, bool] = {
@@ -509,19 +464,6 @@ def run_prompt(entries: List[HostEntry], config: Config) -> tuple:
             event.app.invalidate()    # redraw prompt immediately
         else:
             buf.insert_text(" ")
-
-    if needs_scroll:
-        @kb.add("up", eager=True)
-        def _scroll_up(event):
-            if _offset[0] > 0:
-                _offset[0] -= 1
-                event.app.run_in_terminal(_redraw)
-
-        @kb.add("down", eager=True)
-        def _scroll_down(event):
-            if _offset[0] + vis < total:
-                _offset[0] += 1
-                event.app.run_in_terminal(_redraw)
 
     def _dynamic_prompt():
         """Prompt label; turns orange with a mode tag when any command is active."""
@@ -606,49 +548,55 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(e.hostname)
         return 0
 
-    # Render TUI — show only the visible slice when the list is longer than the screen
-    try:
-        term_h = os.get_terminal_size().lines
-    except OSError:
-        term_h = 40
-    vis = _visible_count(term_h)
-    needs_scroll = RICH_OK and PROMPT_OK and len(entries) > vis
-    display_ui(
-        entries[:vis] if needs_scroll else entries,
-        config,
-        scroll_offset=0,
-        total_count=len(entries) if needs_scroll else None,
-    )
-
-    # Get target (from CLI arg or interactive prompt)
+    # Direct host from CLI arg — connect once and exit
     if args.host:
+        display_ui(entries, config)
         target_text, flags = parse_command(args.host)
         if not target_text:
             target_text = args.host
-    else:
-        target_text, flags = run_prompt(entries, config)
+        entry = find_entry(target_text, entries)
+        if entry.legacy:
+            flags.legacy = True
+        cmd = build_ssh_command(entry, config, flags)
+        show_connect(cmd, dry_run=flags.dry_run)
+        if flags.dry_run:
+            return 0
+        try:
+            return subprocess.call(cmd)
+        except FileNotFoundError:
+            print("Error: 'ssh' not found in PATH.", file=sys.stderr)
+            return 127
+        except KeyboardInterrupt:
+            return 130
 
-    if not target_text:
-        return 1
+    # Interactive loop — stay in sshmngr after each SSH session ends
+    while True:
+        display_ui(entries, config)
+        try:
+            target_text, flags = run_prompt(entries, config)
+        except SystemExit:
+            return 130
 
-    entry = find_entry(target_text, entries)
-    # Per-host legacy flag takes effect even without /l at the prompt
-    if entry.legacy:
-        flags.legacy = True
-    cmd   = build_ssh_command(entry, config, flags)
+        if not target_text:
+            continue
 
-    show_connect(cmd, dry_run=flags.dry_run)
+        entry = find_entry(target_text, entries)
+        # Per-host legacy flag takes effect even without /l at the prompt
+        if entry.legacy:
+            flags.legacy = True
+        cmd = build_ssh_command(entry, config, flags)
 
-    if flags.dry_run:
-        return 0
+        show_connect(cmd, dry_run=flags.dry_run)
 
-    try:
-        return subprocess.call(cmd)
-    except FileNotFoundError:
-        print("Error: 'ssh' not found in PATH.", file=sys.stderr)
-        return 127
-    except KeyboardInterrupt:
-        return 130
+        if flags.dry_run:
+            continue
+
+        try:
+            subprocess.call(cmd)
+        except FileNotFoundError:
+            print("Error: 'ssh' not found in PATH.", file=sys.stderr)
+        except KeyboardInterrupt:
+            pass
 
 
 if __name__ == "__main__":

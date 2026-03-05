@@ -58,7 +58,7 @@ Commands are stackable (e.g. `/l/v hostname`). In `run_prompt()` the WoW-style a
 
 The `legacy` flag can also be set **per-host** via a `legacy=yes` column in `hosts.csv` (full or XIQ-SE format). `main()` merges `entry.legacy` into `flags.legacy` before calling `build_ssh_command()`.
 
-**Scrollable host list** — when `len(entries) > _visible_count(terminal_height)`, `main()` passes only the first visible slice to `display_ui()` (with `total_count` set so a scroll indicator renders). `run_prompt()` then binds `up`/`down` (eager, overriding history nav) to adjust `_offset` and calls `event.app.run_in_terminal(_redraw)`, which clears the screen and re-renders the visible slice. `_UI_OVERHEAD = len(_WIZARD_LINES) + 12` (≈ 23) is the fixed chrome line count; `_visible_count()` returns `max(3, term_height − _UI_OVERHEAD)`. Scroll bindings are only registered when `needs_scroll` is True (both `RICH_OK` and `PROMPT_OK` required).
+**Interactive loop** — `main()` runs a `while True` loop: after each SSH session ends, the TUI is re-displayed and the prompt reappears so the user can connect to another host. Ctrl+C / EOF exits the loop. When a host is passed as a CLI arg, it connects once and exits (no loop).
 
 **`find_entry()` resolution order:** exact hostname → unique prefix → exact IP/host → literal fallback (passed raw to `ssh`).
 
