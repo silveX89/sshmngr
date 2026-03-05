@@ -71,3 +71,7 @@ The `legacy` flag can also be set **per-host** via a `legacy=yes` column in `hos
 **Entry point:** `sshmngr.sshmngr:main` as defined in `pyproject.toml`.
 
 **History file:** `~/.config/sshmngr/.history` (prompt_toolkit `FileHistory`).
+
+## Local data files
+
+`config.ini` and `hosts.csv` in the repo root are **not committed** — they contain local/sensitive host data. The canonical location for these files is `~/.config/sshmngr/`; copies in CWD take precedence (useful for per-project configs).
